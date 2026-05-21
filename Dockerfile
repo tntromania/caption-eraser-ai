@@ -1,4 +1,4 @@
-FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ RUN apt-get update && \
 # --no-deps = nu reinstala torch/torchvision (deja in imaginea de baza)
 RUN pip install --no-cache-dir --no-deps simple-lama-inpainting
 
-# Restul dependintelor simple-lama-inpainting (fara torch)
+# Dependinte simple-lama fara torch
 RUN pip install --no-cache-dir \
     runpod \
     requests \

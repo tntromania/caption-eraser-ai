@@ -1,23 +1,37 @@
 #!/usr/bin/env python3
-"""
-Caption Eraser — RunPod AI Worker
-LaMa inpainting per frame pe GPU.
-"""
+import sys, traceback
 
-import os
-import base64
-import tempfile
-import subprocess
-import runpod
-import requests
-import numpy as np
-import cv2
-from PIL import Image
+print("[INIT] Python start...", flush=True)
 
-print("[INIT] Incarcare LaMa...", flush=True)
-from simple_lama_inpainting import SimpleLama
-LAMA = SimpleLama()
-print("[INIT] LaMa OK", flush=True)
+try:
+    import os, base64, tempfile, subprocess
+    import requests
+    import numpy as np
+    import cv2
+    from PIL import Image
+    print("[INIT] Base imports OK", flush=True)
+except Exception as e:
+    print(f"[FATAL] Base import failed: {e}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
+
+try:
+    import runpod
+    print("[INIT] runpod OK", flush=True)
+except Exception as e:
+    print(f"[FATAL] runpod import failed: {e}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
+
+try:
+    from simple_lama_inpainting import SimpleLama
+    print("[INIT] Incarcare model LaMa...", flush=True)
+    LAMA = SimpleLama()
+    print("[INIT] LaMa gata!", flush=True)
+except Exception as e:
+    print(f"[FATAL] LaMa load failed: {e}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
 
 
 def build_mask(boxes, width, height):
@@ -54,7 +68,6 @@ def process_video(input_path, boxes, width, height, fps):
     writer.release()
     print(f"[PROC] Done: {n} frames", flush=True)
 
-    # Remux cu audio
     final = input_path + "_final.mp4"
     subprocess.run([
         'ffmpeg', '-y', '-nostats', '-loglevel', 'error',
@@ -70,6 +83,7 @@ def process_video(input_path, boxes, width, height, fps):
 
 
 def handler(job):
+    print(f"[JOB] Primit job: {job.get('id', '?')}", flush=True)
     inp = job.get('input', {})
     boxes  = inp.get('boxes', [])
     width  = int(inp.get('width', 0))
@@ -85,17 +99,18 @@ def handler(job):
 
     try:
         if 'video_url' in inp:
-            print(f"[DL] {inp['video_url']}", flush=True)
+            print(f"[DL] Descarcare: {inp['video_url']}", flush=True)
             r = requests.get(inp['video_url'], timeout=300, stream=True)
             r.raise_for_status()
             with open(input_path, 'wb') as f:
                 for chunk in r.iter_content(8 * 1024 * 1024):
                     f.write(chunk)
+            print(f"[DL] OK: {os.path.getsize(input_path)/1024/1024:.1f} MB", flush=True)
         elif 'video_base64' in inp:
             with open(input_path, 'wb') as f:
                 f.write(base64.b64decode(inp['video_base64']))
         else:
-            return {'error': 'Niciun video (video_url sau video_base64)'}
+            return {'error': 'Niciun video furnizat'}
 
         output_path = process_video(input_path, boxes, width, height, fps)
         with open(output_path, 'rb') as f:
@@ -103,6 +118,7 @@ def handler(job):
 
     except Exception as e:
         print(f"[ERROR] {e}", flush=True)
+        traceback.print_exc()
         return {'error': str(e)}
     finally:
         for p in [input_path, input_path + '_raw.mp4', input_path + '_final.mp4']:
@@ -110,4 +126,5 @@ def handler(job):
             except: pass
 
 
+print("[INIT] Pornire runpod worker...", flush=True)
 runpod.serverless.start({'handler': handler})

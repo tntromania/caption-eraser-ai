@@ -56,7 +56,7 @@ def process_video(input_path, boxes, width, height, fps):
         '-video_size',f'{actual_w}x{actual_h}','-framerate',str(actual_fps),
         '-i','pipe:0','-i',input_path,
         '-map','0:v:0','-map','1:a?',
-        '-c:v','libx264','-preset','medium','-crf','18',
+        '-c:v','libx264','-preset','medium','-crf','18','-pix_fmt','yuv420p',
         '-c:a','copy','-movflags','+faststart',final,
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     n = 0
@@ -67,7 +67,7 @@ def process_video(input_path, boxes, width, height, fps):
             if not ret: break
             result = LAMA(Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)), mask_pil)
             try:
-                enc.stdin.write(cv2.cvtColor(np.array(result),cv2.COLOR_RGB2BGR).tobytes())
+                enc.stdin.write(cv2.cvtColor(np.array(result.convert('RGB')),cv2.COLOR_RGB2BGR).tobytes())
             except (BrokenPipeError, ValueError, OSError) as e:
                 write_err = e; break
             n += 1

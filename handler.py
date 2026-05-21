@@ -32,6 +32,41 @@ try:
 except Exception as e:
     print(f"[FATAL] {e}", flush=True); traceback.print_exc(); sys.exit(1)
 
+def auto_detect_boxes(video_path, width, height):
+    """Detectează text în frame-ul de la 30% din video cu EasyOCR (GPU)."""
+    try:
+        import easyocr
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, min(int(total * 0.3), total - 1)))
+        ret, frame_bgr = cap.read()
+        cap.release()
+        if not ret:
+            return []
+        reader = easyocr.Reader(['en', 'ro'], gpu=True, verbose=False)
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = reader.readtext(frame_rgb, detail=1)
+        PAD = 8
+        boxes = []
+        for (bbox, text, conf) in results:
+            if conf < 0.2 or not str(text).strip():
+                continue
+            pts = np.array(bbox, dtype=np.int32)
+            x, y, bw, bh = cv2.boundingRect(pts)
+            boxes.append({
+                'x': int(max(0, x - PAD)),
+                'y': int(max(0, y - PAD)),
+                'w': int(min(width - max(0, x - PAD), bw + 2 * PAD)),
+                'h': int(min(height - max(0, y - PAD), bh + 2 * PAD)),
+            })
+        print(f"[AUTO-DETECT] EasyOCR: {len(boxes)} zone → {boxes}", flush=True)
+        return boxes
+    except Exception as e:
+        print(f"[AUTO-DETECT] Err: {e}", flush=True)
+        traceback.print_exc()
+        return []
+
+
 def build_mask(boxes, width, height):
     mask = np.zeros((height, width), dtype=np.uint8)
     for b in boxes:
@@ -50,19 +85,39 @@ def process_video(input_path, boxes, width, height, fps):
     if probe.returncode != 0:
         raise RuntimeError(f"ffprobe: {probe.stderr[:200]}")
     meta = _json.loads(probe.stdout)['streams'][0]
-    actual_w, actual_h = meta['width'], meta['height']
+    actual_w, actual_h = int(meta['width']), int(meta['height'])
     num, den = map(int, meta['r_frame_rate'].split('/'))
     actual_fps = num / den
     print(f"[PROC] {actual_w}x{actual_h} @ {actual_fps:.4f}fps", flush=True)
 
-    mask_pil = Image.fromarray(build_mask(boxes, actual_w, actual_h))
+    if not boxes:
+        print("[PROC] Boxes goale — auto-detectare text...", flush=True)
+        boxes = auto_detect_boxes(input_path, actual_w, actual_h)
+        if not boxes:
+            raise RuntimeError("Auto-detectare eșuată: niciun text detectat. Furnizează boxes manual.")
+        print(f"[PROC] Auto-detect: {len(boxes)} zone găsite", flush=True)
+
+    # Precompute ROI (masked region + context) — process only this area with LAMA
+    CONTEXT = 30
+    mask_np = build_mask(boxes, actual_w, actual_h)
+    ys, xs = np.where(mask_np > 0)
+    ry1 = max(0, int(ys.min()) - CONTEXT)
+    ry2 = min(actual_h, int(ys.max()) + CONTEXT + 1)
+    rx1 = max(0, int(xs.min()) - CONTEXT)
+    rx2 = min(actual_w, int(xs.max()) + CONTEXT + 1)
+    roi_h, roi_w = ry2 - ry1, rx2 - rx1
+    roi_mask_pil = Image.fromarray(mask_np[ry1:ry2, rx1:rx2])
+    print(f"[PROC] ROI: {roi_w}x{roi_h} @ ({rx1},{ry1})", flush=True)
+
     frame_bytes = actual_w * actual_h * 3
     final = input_path + "_final.mp4"
 
     dec = subprocess.Popen([
         'ffmpeg','-y','-loglevel','error',
         '-i',input_path,
-        '-f','rawvideo','-pixel_format','bgr24','pipe:1'
+        '-map','0:v:0',
+        '-vf',f'scale={actual_w}:{actual_h},format=bgr24',
+        '-f','rawvideo','pipe:1'
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     enc = subprocess.Popen([
@@ -82,14 +137,25 @@ def process_video(input_path, boxes, width, height, fps):
             raw = dec.stdout.read(frame_bytes)
             if len(raw) < frame_bytes: break
             bgr_in = np.frombuffer(raw, dtype=np.uint8).reshape((actual_h, actual_w, 3)).copy()
-            rgb_in = cv2.cvtColor(bgr_in, cv2.COLOR_BGR2RGB)
-            result = LAMA(Image.fromarray(rgb_in), mask_pil)
-            rgb_out = np.array(result.convert('RGB'))
-            if rgb_out.dtype != np.uint8:
-                rgb_out = np.clip(rgb_out * 255, 0, 255).astype(np.uint8)
+
+            # Extract ROI, run LAMA only on caption region
+            roi_bgr = bgr_in[ry1:ry2, rx1:rx2]
+            roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+            result_roi = LAMA(Image.fromarray(roi_rgb), roi_mask_pil)
+            roi_out = np.array(result_roi.convert('RGB'))
+            if roi_out.dtype != np.uint8:
+                roi_out = np.clip(roi_out * 255, 0, 255).astype(np.uint8)
+            # Ensure correct size before pasting back
+            if roi_out.shape[:2] != (roi_h, roi_w):
+                roi_out = cv2.resize(roi_out, (roi_w, roi_h))
+
             if n == 0:
-                print(f"[DBG] in_max={bgr_in.max()} out_max={rgb_out.max()} dtype={rgb_out.dtype}", flush=True)
-            bgr_out = cv2.cvtColor(rgb_out, cv2.COLOR_RGB2BGR)
+                print(f"[DBG] roi_in_max={roi_bgr.max()} roi_out_max={roi_out.max()} roi_out_shape={roi_out.shape}", flush=True)
+
+            # Paste inpainted ROI back into original frame
+            bgr_out = bgr_in.copy()
+            bgr_out[ry1:ry2, rx1:rx2] = cv2.cvtColor(roi_out, cv2.COLOR_RGB2BGR)
+
             try:
                 enc.stdin.write(bgr_out.tobytes())
             except (BrokenPipeError, ValueError, OSError) as e:
@@ -116,8 +182,6 @@ def handler(job):
     inp = job.get('input', {})
     boxes=inp.get('boxes',[]); width=int(inp.get('width',0))
     height=int(inp.get('height',0)); fps=float(inp.get('fps',30.0))
-    if not boxes or width==0 or height==0:
-        return {'error':'Input invalid'}
     tmp=tempfile.NamedTemporaryFile(suffix='.mp4',delete=False); input_path=tmp.name; tmp.close()
     try:
         if 'video_url' in inp:

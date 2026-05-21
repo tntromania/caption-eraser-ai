@@ -27,10 +27,12 @@ RUN pip install --no-cache-dir \
     Pillow \
     huggingface_hub \
     omegaconf \
-    kornia
+    kornia \
+    easyocr
 
-# Pre-download weights LaMa in imagine
+# Pre-download weights LaMa + EasyOCR în imagine (fără re-download la cold start)
 RUN python -c "from simple_lama_inpainting import SimpleLama; SimpleLama(); print('LaMa weights OK')"
+RUN python -c "import easyocr; easyocr.Reader(['en', 'ro'], gpu=False, verbose=False); print('EasyOCR models OK')"
 
 COPY handler.py .
 

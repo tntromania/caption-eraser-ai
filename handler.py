@@ -41,15 +41,30 @@ def build_mask(boxes, width, height):
     return mask
 
 def process_video(input_path, boxes, width, height, fps):
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise RuntimeError("Nu pot deschide videoul")
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = cap.get(cv2.CAP_PROP_FPS) or fps
-    print(f"[PROC] {actual_w}x{actual_h} @ {actual_fps}fps", flush=True)
+    import json as _json
+    probe = subprocess.run(
+        ['ffprobe','-v','error','-select_streams','v:0',
+         '-show_entries','stream=width,height,r_frame_rate','-of','json',input_path],
+        capture_output=True, text=True, timeout=30
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(f"ffprobe: {probe.stderr[:200]}")
+    meta = _json.loads(probe.stdout)['streams'][0]
+    actual_w, actual_h = meta['width'], meta['height']
+    num, den = map(int, meta['r_frame_rate'].split('/'))
+    actual_fps = num / den
+    print(f"[PROC] {actual_w}x{actual_h} @ {actual_fps:.4f}fps", flush=True)
+
     mask_pil = Image.fromarray(build_mask(boxes, actual_w, actual_h))
+    frame_bytes = actual_w * actual_h * 3
     final = input_path + "_final.mp4"
+
+    dec = subprocess.Popen([
+        'ffmpeg','-y','-loglevel','error',
+        '-i',input_path,
+        '-f','rawvideo','-pixel_format','bgr24','pipe:1'
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     enc = subprocess.Popen([
         'ffmpeg','-y','-loglevel','error',
         '-f','rawvideo','-pixel_format','bgr24',
@@ -59,28 +74,41 @@ def process_video(input_path, boxes, width, height, fps):
         '-c:v','libx264','-preset','medium','-crf','18','-pix_fmt','yuv420p',
         '-c:a','copy','-movflags','+faststart',final,
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     n = 0
     write_err = None
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret: break
-            result = LAMA(Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)), mask_pil)
+            raw = dec.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes: break
+            bgr_in = np.frombuffer(raw, dtype=np.uint8).reshape((actual_h, actual_w, 3)).copy()
+            rgb_in = cv2.cvtColor(bgr_in, cv2.COLOR_BGR2RGB)
+            result = LAMA(Image.fromarray(rgb_in), mask_pil)
+            rgb_out = np.array(result.convert('RGB'))
+            if rgb_out.dtype != np.uint8:
+                rgb_out = np.clip(rgb_out * 255, 0, 255).astype(np.uint8)
+            if n == 0:
+                print(f"[DBG] in_max={bgr_in.max()} out_max={rgb_out.max()} dtype={rgb_out.dtype}", flush=True)
+            bgr_out = cv2.cvtColor(rgb_out, cv2.COLOR_RGB2BGR)
             try:
-                enc.stdin.write(cv2.cvtColor(np.array(result.convert('RGB')),cv2.COLOR_RGB2BGR).tobytes())
+                enc.stdin.write(bgr_out.tobytes())
             except (BrokenPipeError, ValueError, OSError) as e:
                 write_err = e; break
             n += 1
             if n % 30 == 0: print(f"[PROC] {n} frames...", flush=True)
     finally:
-        cap.release()
+        try: dec.stdout.close()
+        except: pass
+        try: dec.kill()
+        except: pass
         try: enc.stdin.close()
-        except Exception: pass
-    stderr_data = enc.stderr.read()
+        except: pass
+
+    enc_stderr = enc.stderr.read()
     enc.wait()
     if enc.returncode != 0 or write_err:
-        msg = stderr_data.decode()[:500] if stderr_data else str(write_err)
-        raise RuntimeError(f"FFmpeg: {msg}")
+        msg = enc_stderr.decode()[:500] if enc_stderr else str(write_err)
+        raise RuntimeError(f"FFmpeg enc: {msg}")
     print(f"[PROC] Done: {n} frames", flush=True)
     return final
 

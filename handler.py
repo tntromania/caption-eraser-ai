@@ -41,31 +41,46 @@ def build_mask(boxes, width, height):
     return mask
 
 def process_video(input_path, boxes, width, height, fps):
-    mask_pil = Image.fromarray(build_mask(boxes, width, height))
     cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise RuntimeError("Nu pot deschide videoul")
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+    print(f"[PROC] {actual_w}x{actual_h} @ {actual_fps}fps", flush=True)
+    mask_pil = Image.fromarray(build_mask(boxes, actual_w, actual_h))
     final = input_path + "_final.mp4"
     enc = subprocess.Popen([
         'ffmpeg','-y','-loglevel','error',
         '-f','rawvideo','-pixel_format','bgr24',
-        '-video_size',f'{width}x{height}','-framerate',str(fps),
+        '-video_size',f'{actual_w}x{actual_h}','-framerate',str(actual_fps),
         '-i','pipe:0','-i',input_path,
         '-map','0:v:0','-map','1:a?',
         '-c:v','libx264','-preset','medium','-crf','18',
         '-c:a','copy','-movflags','+faststart',final,
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     n = 0
+    write_err = None
     try:
         while True:
             ret, frame = cap.read()
             if not ret: break
             result = LAMA(Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)), mask_pil)
-            enc.stdin.write(cv2.cvtColor(np.array(result),cv2.COLOR_RGB2BGR).tobytes())
+            try:
+                enc.stdin.write(cv2.cvtColor(np.array(result),cv2.COLOR_RGB2BGR).tobytes())
+            except (BrokenPipeError, ValueError, OSError) as e:
+                write_err = e; break
             n += 1
             if n % 30 == 0: print(f"[PROC] {n} frames...", flush=True)
     finally:
-        cap.release(); enc.stdin.close()
-    _, err = enc.communicate()
-    if enc.returncode != 0: raise RuntimeError(f"FFmpeg: {err.decode()[:300]}")
+        cap.release()
+        try: enc.stdin.close()
+        except Exception: pass
+    stderr_data = enc.stderr.read()
+    enc.wait()
+    if enc.returncode != 0 or write_err:
+        msg = stderr_data.decode()[:500] if stderr_data else str(write_err)
+        raise RuntimeError(f"FFmpeg: {msg}")
     print(f"[PROC] Done: {n} frames", flush=True)
     return final
 

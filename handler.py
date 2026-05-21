@@ -97,37 +97,30 @@ def process_video(input_path, boxes, width, height, fps):
             raise RuntimeError("Auto-detectare eșuată: niciun text detectat. Furnizează boxes manual.")
         print(f"[PROC] Auto-detect: {len(boxes)} zone găsite", flush=True)
 
-    # Precompute ROI (masked region + context) — process only this area with LAMA
-    CONTEXT = 30
-    mask_np = build_mask(boxes, actual_w, actual_h)
-    ys, xs = np.where(mask_np > 0)
-    ry1 = max(0, int(ys.min()) - CONTEXT)
-    ry2 = min(actual_h, int(ys.max()) + CONTEXT + 1)
-    rx1 = max(0, int(xs.min()) - CONTEXT)
-    rx2 = min(actual_w, int(xs.max()) + CONTEXT + 1)
-    roi_h, roi_w = ry2 - ry1, rx2 - rx1
-    roi_mask_pil = Image.fromarray(mask_np[ry1:ry2, rx1:rx2])
-    print(f"[PROC] ROI: {roi_w}x{roi_h} @ ({rx1},{ry1})", flush=True)
+    mask_np  = build_mask(boxes, actual_w, actual_h)
+    mask_pil = Image.fromarray(mask_np)
+    print(f"[PROC] Mască: {actual_w}x{actual_h}, {int(mask_np.sum()//255)} pixeli marcați", flush=True)
 
     frame_bytes = actual_w * actual_h * 3
     final = input_path + "_final.mp4"
 
     dec = subprocess.Popen([
         'ffmpeg','-y','-loglevel','error',
-        '-i',input_path,
+        '-i', input_path,
         '-map','0:v:0',
-        '-vf',f'scale={actual_w}:{actual_h},format=bgr24',
+        '-vf', f'scale={actual_w}:{actual_h},format=bgr24',
         '-f','rawvideo','pipe:1'
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     enc = subprocess.Popen([
         'ffmpeg','-y','-loglevel','error',
         '-f','rawvideo','-pixel_format','bgr24',
-        '-video_size',f'{actual_w}x{actual_h}','-framerate',str(actual_fps),
-        '-i','pipe:0','-i',input_path,
+        '-video_size', f'{actual_w}x{actual_h}',
+        '-framerate', str(actual_fps),
+        '-i','pipe:0','-i', input_path,
         '-map','0:v:0','-map','1:a?',
         '-c:v','libx264','-preset','medium','-crf','18','-pix_fmt','yuv420p',
-        '-c:a','copy','-movflags','+faststart',final,
+        '-c:a','copy','-movflags','+faststart', final,
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     n = 0
@@ -135,33 +128,31 @@ def process_video(input_path, boxes, width, height, fps):
     try:
         while True:
             raw = dec.stdout.read(frame_bytes)
-            if len(raw) < frame_bytes: break
-            bgr_in = np.frombuffer(raw, dtype=np.uint8).reshape((actual_h, actual_w, 3)).copy()
+            if len(raw) < frame_bytes:
+                break
 
-            # Extract ROI, run LAMA only on caption region
-            roi_bgr = bgr_in[ry1:ry2, rx1:rx2]
-            roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
-            result_roi = LAMA(Image.fromarray(roi_rgb), roi_mask_pil)
-            roi_out = np.array(result_roi.convert('RGB'))
-            if roi_out.dtype != np.uint8:
-                roi_out = np.clip(roi_out * 255, 0, 255).astype(np.uint8)
-            # Ensure correct size before pasting back
-            if roi_out.shape[:2] != (roi_h, roi_w):
-                roi_out = cv2.resize(roi_out, (roi_w, roi_h))
+            bgr_in  = np.frombuffer(raw, dtype=np.uint8).reshape((actual_h, actual_w, 3)).copy()
+            frame_pil = Image.fromarray(cv2.cvtColor(bgr_in, cv2.COLOR_BGR2RGB))
+
+            # LaMa inpainting pe frame-ul complet — fără ROI, fără rescalare
+            result_pil = LAMA(frame_pil, mask_pil)
+            bgr_out = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+
+            # Garanție dimensiuni identice înainte de scriere
+            if bgr_out.shape[:2] != (actual_h, actual_w):
+                print(f"[WARN] resize {bgr_out.shape} → ({actual_h},{actual_w})", flush=True)
+                bgr_out = cv2.resize(bgr_out, (actual_w, actual_h))
 
             if n == 0:
-                print(f"[DBG] roi_in_max={roi_bgr.max()} roi_out_max={roi_out.max()} roi_out_shape={roi_out.shape}", flush=True)
-
-            # Paste inpainted ROI back into original frame
-            bgr_out = bgr_in.copy()
-            bgr_out[ry1:ry2, rx1:rx2] = cv2.cvtColor(roi_out, cv2.COLOR_RGB2BGR)
+                print(f"[DBG] in={bgr_in.shape} out={bgr_out.shape} dtype={bgr_out.dtype}", flush=True)
 
             try:
                 enc.stdin.write(bgr_out.tobytes())
             except (BrokenPipeError, ValueError, OSError) as e:
                 write_err = e; break
             n += 1
-            if n % 30 == 0: print(f"[PROC] {n} frames...", flush=True)
+            if n % 30 == 0:
+                print(f"[PROC] {n} frames...", flush=True)
     finally:
         try: dec.stdout.close()
         except: pass

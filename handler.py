@@ -3,7 +3,6 @@ import os, sys, subprocess, traceback
 
 print("[INIT] Python start...", flush=True)
 
-# Detectam Blackwell INAINTE de import torch
 def _maybe_force_cpu():
     try:
         r = subprocess.run(
@@ -61,23 +60,17 @@ def build_mask(boxes, width, height):
 
 
 def process_video(input_path, boxes, width, height, fps):
-    """
-    Procesează frame cu frame prin LaMa, trimite direct la FFmpeg via pipe.
-    Zero fișiere intermediare corupte — același pattern ca app-ul principal.
-    """
     mask_pil = Image.fromarray(build_mask(boxes, width, height))
     cap = cv2.VideoCapture(input_path)
-
     final = input_path + "_final.mp4"
 
-    # FFmpeg primește frame-uri raw BGR pe stdin, muxează cu audio din original
     encoder = subprocess.Popen([
         'ffmpeg', '-y', '-loglevel', 'error',
         '-f', 'rawvideo', '-pixel_format', 'bgr24',
         '-video_size', f'{width}x{height}',
         '-framerate', str(fps),
-        '-i', 'pipe:0',        # frame-uri procesate
-        '-i', input_path,      # audio original
+        '-i', 'pipe:0',
+        '-i', input_path,
         '-map', '0:v:0',
         '-map', '1:a?',
         '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
@@ -92,7 +85,6 @@ def process_video(input_path, boxes, width, height, fps):
             ret, frame = cap.read()
             if not ret:
                 break
-
             result = LAMA(
                 Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
                 mask_pil
@@ -111,7 +103,7 @@ def process_video(input_path, boxes, width, height, fps):
     if encoder.returncode != 0:
         raise RuntimeError(f"FFmpeg encoding failed: {stderr_data.decode()[:500]}")
 
-    print(f"[PROC] Done: {n} frames → {final}", flush=True)
+    print(f"[PROC] Done: {n} frames", flush=True)
     return final
 
 

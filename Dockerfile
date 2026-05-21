@@ -1,16 +1,25 @@
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
+ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3-pip \
         ffmpeg libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# --no-deps = nu reinstala torch/torchvision (deja in imaginea de baza)
+RUN python3.11 -m pip install --no-cache-dir --upgrade pip && \
+    ln -sf /usr/bin/python3.11 /usr/local/bin/python
+
+# PyTorch 2.7 cu CUDA 12.8 → suport nativ Blackwell sm_120
+RUN pip install --no-cache-dir \
+    torch==2.7.0 torchvision==0.22.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# --no-deps = nu reinstala torch
 RUN pip install --no-cache-dir --no-deps simple-lama-inpainting
 
-# Dependinte simple-lama fara torch
 RUN pip install --no-cache-dir \
     runpod \
     requests \

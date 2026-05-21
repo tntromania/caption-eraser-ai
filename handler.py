@@ -1,33 +1,50 @@
 #!/usr/bin/env python3
-import sys, traceback
+import os, sys, subprocess, traceback
 
 print("[INIT] Python start...", flush=True)
 
+# ── Detectam Blackwell INAINTE de import torch ────────────────
+# Daca GPU e sm_120+ (Blackwell) si PyTorch e vechi, fortam CPU.
+def _maybe_force_cpu():
+    try:
+        r = subprocess.run(
+            ['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0:
+            return
+        cap = float(r.stdout.strip().split('\n')[0].strip())  # ex: "12.0"
+        if cap >= 12.0:
+            print(f"[INIT] Blackwell GPU (sm_{int(cap*10)}) detectat → CPU fallback activat", flush=True)
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+        else:
+            print(f"[INIT] GPU sm_{int(cap*10)} OK pentru CUDA", flush=True)
+    except Exception as e:
+        print(f"[INIT] nvidia-smi check skip: {e}", flush=True)
+
+_maybe_force_cpu()
+
+# ── Importuri (dupa ce am setat CUDA_VISIBLE_DEVICES) ─────────
 try:
-    import os, base64, tempfile, subprocess
+    import base64, tempfile
     import requests
     import numpy as np
     import cv2
     from PIL import Image
-    print("[INIT] Base imports OK", flush=True)
-except Exception as e:
-    print(f"[FATAL] Base import failed: {e}", flush=True)
-    traceback.print_exc()
-    sys.exit(1)
-
-try:
     import runpod
-    print("[INIT] runpod OK", flush=True)
+    print("[INIT] Importuri OK", flush=True)
 except Exception as e:
-    print(f"[FATAL] runpod import failed: {e}", flush=True)
+    print(f"[FATAL] Import failed: {e}", flush=True)
     traceback.print_exc()
     sys.exit(1)
 
 try:
     from simple_lama_inpainting import SimpleLama
-    print("[INIT] Incarcare model LaMa...", flush=True)
+    print("[INIT] Incarcare LaMa...", flush=True)
     LAMA = SimpleLama()
-    print("[INIT] LaMa gata!", flush=True)
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"[INIT] LaMa gata pe {device.upper()}!", flush=True)
 except Exception as e:
     print(f"[FATAL] LaMa load failed: {e}", flush=True)
     traceback.print_exc()
@@ -48,7 +65,6 @@ def build_mask(boxes, width, height):
 
 def process_video(input_path, boxes, width, height, fps):
     mask_pil = Image.fromarray(build_mask(boxes, width, height))
-
     cap = cv2.VideoCapture(input_path)
     raw_out = input_path + "_raw.mp4"
     writer = cv2.VideoWriter(raw_out, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
@@ -77,13 +93,12 @@ def process_video(input_path, boxes, width, height, fps):
         '-c:a', 'copy', '-movflags', '+faststart',
         final,
     ], check=True)
-
     os.remove(raw_out)
     return final
 
 
 def handler(job):
-    print(f"[JOB] Primit job: {job.get('id', '?')}", flush=True)
+    print(f"[JOB] {job.get('id', '?')}", flush=True)
     inp = job.get('input', {})
     boxes  = inp.get('boxes', [])
     width  = int(inp.get('width', 0))
@@ -99,13 +114,13 @@ def handler(job):
 
     try:
         if 'video_url' in inp:
-            print(f"[DL] Descarcare: {inp['video_url']}", flush=True)
+            print(f"[DL] {inp['video_url']}", flush=True)
             r = requests.get(inp['video_url'], timeout=300, stream=True)
             r.raise_for_status()
             with open(input_path, 'wb') as f:
                 for chunk in r.iter_content(8 * 1024 * 1024):
                     f.write(chunk)
-            print(f"[DL] OK: {os.path.getsize(input_path)/1024/1024:.1f} MB", flush=True)
+            print(f"[DL] {os.path.getsize(input_path)/1024/1024:.1f} MB", flush=True)
         elif 'video_base64' in inp:
             with open(input_path, 'wb') as f:
                 f.write(base64.b64decode(inp['video_base64']))
@@ -126,5 +141,5 @@ def handler(job):
             except: pass
 
 
-print("[INIT] Pornire runpod worker...", flush=True)
+print("[INIT] Pornire worker...", flush=True)
 runpod.serverless.start({'handler': handler})

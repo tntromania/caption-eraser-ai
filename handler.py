@@ -3,28 +3,25 @@ import os, sys, subprocess, traceback
 
 print("[INIT] Python start...", flush=True)
 
-# ── Detectam Blackwell INAINTE de import torch ────────────────
-# Daca GPU e sm_120+ (Blackwell) si PyTorch e vechi, fortam CPU.
+# Detectam Blackwell INAINTE de import torch
 def _maybe_force_cpu():
     try:
         r = subprocess.run(
             ['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
             capture_output=True, text=True, timeout=5
         )
-        if r.returncode != 0:
-            return
-        cap = float(r.stdout.strip().split('\n')[0].strip())  # ex: "12.0"
-        if cap >= 12.0:
-            print(f"[INIT] Blackwell GPU (sm_{int(cap*10)}) detectat → CPU fallback activat", flush=True)
-            os.environ['CUDA_VISIBLE_DEVICES'] = ''
-        else:
-            print(f"[INIT] GPU sm_{int(cap*10)} OK pentru CUDA", flush=True)
+        if r.returncode == 0:
+            cap = float(r.stdout.strip().split('\n')[0].strip())
+            if cap >= 12.0:
+                print(f"[INIT] Blackwell sm_{int(cap*10)} → CPU fallback", flush=True)
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            else:
+                print(f"[INIT] GPU sm_{int(cap*10)} OK", flush=True)
     except Exception as e:
-        print(f"[INIT] nvidia-smi check skip: {e}", flush=True)
+        print(f"[INIT] GPU check skip: {e}", flush=True)
 
 _maybe_force_cpu()
 
-# ── Importuri (dupa ce am setat CUDA_VISIBLE_DEVICES) ─────────
 try:
     import base64, tempfile
     import requests
@@ -46,7 +43,7 @@ try:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[INIT] LaMa gata pe {device.upper()}!", flush=True)
 except Exception as e:
-    print(f"[FATAL] LaMa load failed: {e}", flush=True)
+    print(f"[FATAL] LaMa failed: {e}", flush=True)
     traceback.print_exc()
     sys.exit(1)
 
@@ -64,36 +61,57 @@ def build_mask(boxes, width, height):
 
 
 def process_video(input_path, boxes, width, height, fps):
+    """
+    Procesează frame cu frame prin LaMa, trimite direct la FFmpeg via pipe.
+    Zero fișiere intermediare corupte — același pattern ca app-ul principal.
+    """
     mask_pil = Image.fromarray(build_mask(boxes, width, height))
     cap = cv2.VideoCapture(input_path)
-    raw_out = input_path + "_raw.mp4"
-    writer = cv2.VideoWriter(raw_out, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-
-    n = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        result = LAMA(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), mask_pil)
-        writer.write(cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR))
-        n += 1
-        if n % 30 == 0:
-            print(f"[PROC] {n} frames...", flush=True)
-
-    cap.release()
-    writer.release()
-    print(f"[PROC] Done: {n} frames", flush=True)
 
     final = input_path + "_final.mp4"
-    subprocess.run([
-        'ffmpeg', '-y', '-nostats', '-loglevel', 'error',
-        '-i', raw_out, '-i', input_path,
-        '-map', '0:v:0', '-map', '1:a?',
+
+    # FFmpeg primește frame-uri raw BGR pe stdin, muxează cu audio din original
+    encoder = subprocess.Popen([
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-f', 'rawvideo', '-pixel_format', 'bgr24',
+        '-video_size', f'{width}x{height}',
+        '-framerate', str(fps),
+        '-i', 'pipe:0',        # frame-uri procesate
+        '-i', input_path,      # audio original
+        '-map', '0:v:0',
+        '-map', '1:a?',
         '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
-        '-c:a', 'copy', '-movflags', '+faststart',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
         final,
-    ], check=True)
-    os.remove(raw_out)
+    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    n = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            result = LAMA(
+                Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
+                mask_pil
+            )
+            encoder.stdin.write(
+                cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR).tobytes()
+            )
+            n += 1
+            if n % 30 == 0:
+                print(f"[PROC] {n} frames...", flush=True)
+    finally:
+        cap.release()
+        encoder.stdin.close()
+
+    _, stderr_data = encoder.communicate()
+    if encoder.returncode != 0:
+        raise RuntimeError(f"FFmpeg encoding failed: {stderr_data.decode()[:500]}")
+
+    print(f"[PROC] Done: {n} frames → {final}", flush=True)
     return final
 
 
@@ -120,7 +138,7 @@ def handler(job):
             with open(input_path, 'wb') as f:
                 for chunk in r.iter_content(8 * 1024 * 1024):
                     f.write(chunk)
-            print(f"[DL] {os.path.getsize(input_path)/1024/1024:.1f} MB", flush=True)
+            print(f"[DL] {os.path.getsize(input_path)/1024/1024:.1f} MB OK", flush=True)
         elif 'video_base64' in inp:
             with open(input_path, 'wb') as f:
                 f.write(base64.b64decode(inp['video_base64']))
@@ -128,6 +146,7 @@ def handler(job):
             return {'error': 'Niciun video furnizat'}
 
         output_path = process_video(input_path, boxes, width, height, fps)
+
         with open(output_path, 'rb') as f:
             return {'video_base64': base64.b64encode(f.read()).decode()}
 
@@ -136,10 +155,10 @@ def handler(job):
         traceback.print_exc()
         return {'error': str(e)}
     finally:
-        for p in [input_path, input_path + '_raw.mp4', input_path + '_final.mp4']:
+        for p in [input_path, input_path + '_final.mp4']:
             try: os.remove(p)
             except: pass
 
 
-print("[INIT] Pornire worker...", flush=True)
+print("[INIT] Worker pornit.", flush=True)
 runpod.serverless.start({'handler': handler})

@@ -41,10 +41,13 @@ try:
         LAMA.device = DEVICE
     except Exception:
         pass
-    # fp16 via autocast pe GPU → ~2× mai rapid, fără să atingem signature-ul LaMa
-    USE_FP16 = USE_CUDA
-    if USE_FP16:
-        print("[INIT] LaMa → fp16 autocast pe GPU", flush=True)
+    # fp16 e DEZACTIVAT pentru LaMa: modelul folosește Fourier convolutions (FFC),
+    # iar cuFFT nu suportă fp16 decât pe dimensiuni putere-de-2.
+    # ROI-urile noastre au dimensiuni arbitrare (ex. 20×64, 21×56) → cuFFT crapă.
+    # Rămânem pe fp32 pe GPU — tot e 5-10× mai rapid decât CPU.
+    USE_FP16 = False
+    if USE_CUDA:
+        print("[INIT] LaMa → fp32 pe GPU (fp16 incompatibil cu cuFFT non-pow2)", flush=True)
     print(f"[INIT] LaMa pe {'CUDA' if USE_CUDA else 'CPU'}!", flush=True)
 except Exception as e:
     print(f"[FATAL] {e}", flush=True); traceback.print_exc(); sys.exit(1)

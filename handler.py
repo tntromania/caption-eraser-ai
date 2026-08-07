@@ -179,6 +179,53 @@ def _merge_overlapping(boxes, W, H, gap=8):
 
 
 # ─────────────────────────────────────────────────────────────
+# Intervale de timp per box
+# ─────────────────────────────────────────────────────────────
+# Un box poate avea `t0`/`t1` (secunde) — se aplică doar între ele. Fără ele,
+# e activ pe tot clipul (comportamentul dinainte).
+#
+# De ce contează: un box static trebuie să încapă cea mai lungă subtitrare din
+# clip, deci pe cuvintele scurte acoperă mult fundal curat pe care LaMa îl
+# re-sintetizează degeaba. Cu intervale, userul pune box strâns pe fiecare
+# bucată. Rezolvă și logo-urile care apar doar pe o parte din clip.
+#
+# Intervalele vin de la user, nu dintr-un detector — deci nu există riscul de
+# „a rămas text pe ecran" din strângerea automată: ce n-a marcat el rămâne
+# neatins, exact ca acum.
+def segment_boxes_by_time(boxes, fps, n_frames):
+    """[(f_start, f_end, [box, ...]), ...] — segmente cu set constant de box-uri.
+    Segmentele fără niciun box activ sunt incluse cu listă goală (cadre copiate
+    ca atare, fără LaMa)."""
+    if n_frames <= 0:
+        return [(0, 0, list(boxes))]
+
+    def _f(v, default):
+        if v is None:
+            return default
+        try:
+            return max(0, min(n_frames, int(round(float(v) * fps))))
+        except (TypeError, ValueError):
+            return default
+
+    spans = []
+    for b in boxes:
+        f0 = _f(b.get('t0'), 0)
+        f1 = _f(b.get('t1'), n_frames)
+        if f1 <= f0:                      # interval invalid → box pe tot clipul
+            f0, f1 = 0, n_frames
+        spans.append((f0, f1, b))
+
+    cuts = sorted({0, n_frames} | {s[0] for s in spans} | {s[1] for s in spans})
+    segs = []
+    for a, z in zip(cuts, cuts[1:]):
+        if z <= a:
+            continue
+        active = [b for (f0, f1, b) in spans if f0 <= a and f1 >= z]
+        segs.append((a, z, active))
+    return segs or [(0, n_frames, list(boxes))]
+
+
+# ─────────────────────────────────────────────────────────────
 # Mask building — dilation gaussian peste fiecare box
 # ─────────────────────────────────────────────────────────────
 def build_mask_for_boxes(boxes, W, H, feather=6):
@@ -283,29 +330,51 @@ def process_video(input_path, boxes, width, height, fps):
             raise RuntimeError("Auto-detectare eșuată: niciun text. Furnizează boxes manual.")
         print(f"[PROC] Auto-detect: {len(boxes)} zone", flush=True)
 
-    # Mască full-frame (pentru lookup) + clustere ROI
-    mask_np = build_mask_for_boxes(boxes, actual_w, actual_h, feather=6)
-    mask_full_pil = Image.fromarray(mask_np)
-    rois = cluster_boxes_into_rois(boxes, actual_w, actual_h, context=40, max_gap=120)
-    if not rois:
+    def build_roi_data(bxs):
+        """Mască full-frame + clustere ROI, cu masca și alpha pre-decupate."""
+        if not bxs:
+            return [], 0
+        mask_full = Image.fromarray(build_mask_for_boxes(bxs, actual_w, actual_h, feather=6))
+        out, px = [], 0
+        for (rx1, ry1, rx2, ry2) in cluster_boxes_into_rois(bxs, actual_w, actual_h,
+                                                           context=40, max_gap=120):
+            rw, rh = rx2 - rx1, ry2 - ry1
+            roi_mask = mask_full.crop((rx1, ry1, rx2, ry2))
+            # alpha pentru compozitare: masca e binară (build_mask_for_boxes o
+            # re-binarizează după blur), deci îi dăm aici o margine moale de câțiva
+            # pixeli ca lipitura să nu se vadă ca o muchie dreaptă
+            alpha = cv2.GaussianBlur(np.asarray(roi_mask, dtype=np.float32) / 255.0, (7, 7), 0)
+            out.append({'box': (rx1, ry1, rx2, ry2), 'mask': roi_mask, 'wh': (rw, rh),
+                        'alpha': alpha[:, :, None]})
+            px += rw * rh
+        return out, px
+
+    n_frames_est = 0
+    try:
+        _c = cv2.VideoCapture(input_path)
+        n_frames_est = int(_c.get(cv2.CAP_PROP_FRAME_COUNT))
+        _c.release()
+    except Exception:
+        pass
+
+    segments = segment_boxes_by_time(boxes, actual_fps, n_frames_est)
+    seg_rois, seg_starts, max_px = [], [], 0
+    for (f0, f1, active) in segments:
+        rd, px = build_roi_data(active)
+        seg_rois.append(rd)
+        seg_starts.append(f0)
+        max_px = max(max_px, px)
+    if not any(seg_rois):
         raise RuntimeError("Niciun ROI valid după clustering.")
 
-    # Pre-crop mask per ROI (o singură dată)
-    roi_data = []
-    total_roi_px = 0
-    for (rx1, ry1, rx2, ry2) in rois:
-        rw, rh = rx2 - rx1, ry2 - ry1
-        roi_mask = mask_full_pil.crop((rx1, ry1, rx2, ry2))
-        # alpha pentru compozitare: masca e binară (build_mask_for_boxes o
-        # re-binarizează după blur), deci îi dăm aici o margine moale de câțiva
-        # pixeli ca lipitura să nu se vadă ca o muchie dreaptă
-        alpha = cv2.GaussianBlur(np.asarray(roi_mask, dtype=np.float32) / 255.0, (7, 7), 0)
-        roi_data.append({'box': (rx1, ry1, rx2, ry2), 'mask': roi_mask, 'wh': (rw, rh),
-                         'alpha': alpha[:, :, None]})
-        total_roi_px += rw * rh
-    speedup = round((actual_w * actual_h) / max(1, total_roi_px))
-    print(f"[PROC] {len(rois)} ROI(s), total {total_roi_px}px — speedup ~{speedup}x", flush=True)
-    for i, rd in enumerate(roi_data):
+    if len(segments) > 1:
+        print(f"[PROC] {len(segments)} segmente de timp:", flush=True)
+        for (f0, f1, active), rd in zip(segments, seg_rois):
+            print(f"[PROC]   cadre {f0}-{f1} ({f0/actual_fps:.1f}-{f1/actual_fps:.1f}s): "
+                  f"{len(active)} box(uri), {len(rd)} ROI", flush=True)
+    speedup = round((actual_w * actual_h) / max(1, max_px))
+    print(f"[PROC] ROI maxim {max_px}px — speedup ~{speedup}x", flush=True)
+    for i, rd in enumerate(seg_rois[0]):
         rx1, ry1, rx2, ry2 = rd['box']
         print(f"[PROC]   ROI #{i+1}: {rx2-rx1}x{ry2-ry1} @ ({rx1},{ry1})", flush=True)
 
@@ -354,6 +423,7 @@ def process_video(input_path, boxes, width, height, fps):
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     n = 0
+    seg_i = 0
     write_err = None
     t_start = time.time()
     try:
@@ -363,8 +433,13 @@ def process_video(input_path, boxes, width, height, fps):
                 break
             bgr_in = np.frombuffer(raw, dtype=np.uint8).reshape((actual_h, actual_w, 3)).copy()
 
+            # Segmentul de timp curent. Unde userul n-a marcat nimic, lista de
+            # ROI-uri e goală și cadrul trece neatins — deci și mai repede.
+            while seg_i + 1 < len(seg_starts) and n >= seg_starts[seg_i + 1]:
+                seg_i += 1
+
             # Procesăm fiecare ROI separat — modificăm in-place
-            for rd in roi_data:
+            for rd in seg_rois[seg_i]:
                 rx1, ry1, rx2, ry2 = rd['box']
                 roi_w, roi_h = rd['wh']
                 roi_bgr = bgr_in[ry1:ry2, rx1:rx2].copy()
@@ -383,7 +458,7 @@ def process_video(input_path, boxes, width, height, fps):
                 ).astype(np.uint8)
 
             if n == 0:
-                print(f"[DBG] frame={bgr_in.shape} rois={len(roi_data)}", flush=True)
+                print(f"[DBG] frame={bgr_in.shape} rois={len(seg_rois[seg_i])}", flush=True)
 
             try:
                 enc.stdin.write(bgr_in.tobytes())

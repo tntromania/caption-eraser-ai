@@ -68,8 +68,28 @@ def _detect_nvenc():
         return False
     try:
         r = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, timeout=5)
-        return 'h264_nvenc' in r.stdout
+        if 'h264_nvenc' not in r.stdout:
+            return False
     except Exception:
+        return False
+    # `-encoders` zice doar cu ce a fost COMPILAT ffmpeg — e mereu true pe imaginea
+    # nvidia/cuda. Nu spune nimic despre disponibilitatea reală a NVENC: dacă
+    # containerul n-a primit capability-ul `video`, libnvidia-encode nu e montat
+    # și OpenEncodeSessionEx crapă abia la runtime cu "unsupported device (2) /
+    # No capable devices found". Deci probăm un encode real.
+    try:
+        r = subprocess.run([
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+            '-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=0.1',
+            '-c:v', 'h264_nvenc', '-f', 'null', '-',
+        ], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            print(f"[INIT] NVENC listat de ffmpeg dar inutilizabil aici: "
+                  f"{(r.stderr or '').strip()[:200]}", flush=True)
+            return False
+        return True
+    except Exception as e:
+        print(f"[INIT] Probă NVENC eșuată ({e}) → cad pe CPU", flush=True)
         return False
 HAS_NVENC = _detect_nvenc()
 print(f"[INIT] Encoder: {'h264_nvenc (GPU)' if HAS_NVENC else 'libx264 (CPU)'}", flush=True)
@@ -213,6 +233,7 @@ def inpaint_roi(roi_bgr_np, roi_mask_pil):
 # Main process
 # ─────────────────────────────────────────────────────────────
 def process_video(input_path, boxes, width, height, fps):
+    global HAS_NVENC
     import json as _json
     probe = subprocess.run(
         ['ffprobe','-v','error','-select_streams','v:0',
@@ -268,31 +289,36 @@ def process_video(input_path, boxes, width, height, fps):
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     # Encoder — NVENC pe GPU, altfel x264
+    def _enc_args(use_nvenc):
+        codec = (['-c:v','h264_nvenc','-preset','p4','-tune','hq',
+                  '-rc','vbr','-cq','23','-b:v','0','-pix_fmt','yuv420p']
+                 if use_nvenc else
+                 ['-c:v','libx264','-preset','fast','-crf','23','-pix_fmt','yuv420p'])
+        return [
+            'ffmpeg','-y','-loglevel','error',
+            '-f','rawvideo','-pixel_format','bgr24',
+            '-video_size', f'{actual_w}x{actual_h}',
+            '-framerate', str(actual_fps),
+            '-i','pipe:0','-i', input_path,
+            '-map','0:v:0','-map','1:a?',
+            *codec,
+            '-c:a','copy','-movflags','+faststart', final,
+        ]
+
+    enc = subprocess.Popen(_enc_args(HAS_NVENC), stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # NVENC poate pica și după proba de la boot: limita de sesiuni concurente pe
+    # un GPU partajat, sau un host care nu dă capability-ul `video`. Eșecul e la
+    # init-ul output stream-ului, deci ffmpeg moare în primele ms — îl prindem
+    # aici și repornim pe libx264, ca să nu pierdem tot jobul degeaba.
     if HAS_NVENC:
-        enc_args = [
-            'ffmpeg','-y','-loglevel','error',
-            '-f','rawvideo','-pixel_format','bgr24',
-            '-video_size', f'{actual_w}x{actual_h}',
-            '-framerate', str(actual_fps),
-            '-i','pipe:0','-i', input_path,
-            '-map','0:v:0','-map','1:a?',
-            '-c:v','h264_nvenc','-preset','p4','-tune','hq',
-            '-rc','vbr','-cq','23','-b:v','0',
-            '-pix_fmt','yuv420p',
-            '-c:a','copy','-movflags','+faststart', final,
-        ]
-    else:
-        enc_args = [
-            'ffmpeg','-y','-loglevel','error',
-            '-f','rawvideo','-pixel_format','bgr24',
-            '-video_size', f'{actual_w}x{actual_h}',
-            '-framerate', str(actual_fps),
-            '-i','pipe:0','-i', input_path,
-            '-map','0:v:0','-map','1:a?',
-            '-c:v','libx264','-preset','fast','-crf','23','-pix_fmt','yuv420p',
-            '-c:a','copy','-movflags','+faststart', final,
-        ]
-    enc = subprocess.Popen(enc_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        if enc.poll() is not None:
+            err = (enc.stderr.read().decode(errors='replace') or '').strip()[:300]
+            print(f"[PROC] NVENC a murit la init ({err}) → refac encoderul pe libx264", flush=True)
+            HAS_NVENC = False
+            enc = subprocess.Popen(_enc_args(False), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     n = 0
     write_err = None

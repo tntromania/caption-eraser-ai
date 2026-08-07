@@ -1,5 +1,13 @@
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
+# Imaginea de bază vine cu NVIDIA_DRIVER_CAPABILITIES=compute,utility. Fără
+# `video`, runtime-ul NVIDIA nu montează libnvidia-encode în container: ffmpeg
+# tot listează h264_nvenc (e compilat în el), dar OpenEncodeSessionEx crapă cu
+# "unsupported device (2) / No capable devices found" și jobul moare. Se vedea
+# doar pe unele workere, fiindcă o parte din hosturile RunPod suprascriu oricum
+# capability-ul cu `all` — de aici intermitența.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 

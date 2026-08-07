@@ -220,13 +220,41 @@ def cluster_boxes_into_rois(boxes, W, H, context=40, max_gap=120):
 # ─────────────────────────────────────────────────────────────
 # Inpainting pe un ROI — fp16 dacă suntem pe GPU
 # ─────────────────────────────────────────────────────────────
+# Plafon pe latura lungă a ROI-ului dat lui LaMa. Costul lui crește liniar cu
+# pixelii, iar un box tras peste tot ecranul pe un video 4K dădea un ROI de
+# 2160x3830 (8.3 Mpx) → 0.6 fps → 600 de cadre în ~17 minute, peste timeout,
+# job picat, ȘI endpointul blocat o oră pentru toți ceilalți din coadă.
+# LaMa n-are nevoie de 4K ca să reconstruiască fundalul din spatele unui text:
+# rulăm plafonat și compozităm înapoi DOAR sub mască (vezi process_video), deci
+# pixelii nemascați rămân originali, la rezoluție plină.
+LAMA_MAX_SIDE = int(os.environ.get('LAMA_MAX_SIDE', '1280'))
+
+
 @torch.inference_mode()
-def inpaint_roi(roi_bgr_np, roi_mask_pil):
-    roi_rgb_pil = Image.fromarray(cv2.cvtColor(roi_bgr_np, cv2.COLOR_BGR2RGB))
+def _lama_call(bgr_np, mask_pil):
+    rgb_pil = Image.fromarray(cv2.cvtColor(bgr_np, cv2.COLOR_BGR2RGB))
     if USE_FP16:
         with torch.autocast(device_type='cuda', dtype=torch.float16):
-            return LAMA(roi_rgb_pil, roi_mask_pil)
-    return LAMA(roi_rgb_pil, roi_mask_pil)
+            return LAMA(rgb_pil, mask_pil)
+    return LAMA(rgb_pil, mask_pil)
+
+
+def inpaint_roi(roi_bgr_np, roi_mask_pil):
+    h, w = roi_bgr_np.shape[:2]
+    scale = min(1.0, LAMA_MAX_SIDE / float(max(w, h)))
+    if scale >= 1.0:
+        out = _lama_call(roi_bgr_np, roi_mask_pil)
+        return out if out.size == (w, h) else out.resize((w, h), Image.LANCZOS)
+
+    sw = max(8, int(round(w * scale)))
+    sh = max(8, int(round(h * scale)))
+    small = cv2.resize(roi_bgr_np, (sw, sh), interpolation=cv2.INTER_AREA)
+    # masca se scalează cu NEAREST — trebuie să rămână binară, nu interpolată
+    small_mask = roi_mask_pil.resize((sw, sh), Image.NEAREST)
+    out = _lama_call(small, small_mask)
+    if out.size != (sw, sh):
+        out = out.resize((sw, sh), Image.LANCZOS)
+    return out.resize((w, h), Image.LANCZOS)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -268,7 +296,12 @@ def process_video(input_path, boxes, width, height, fps):
     for (rx1, ry1, rx2, ry2) in rois:
         rw, rh = rx2 - rx1, ry2 - ry1
         roi_mask = mask_full_pil.crop((rx1, ry1, rx2, ry2))
-        roi_data.append({'box': (rx1, ry1, rx2, ry2), 'mask': roi_mask, 'wh': (rw, rh)})
+        # alpha pentru compozitare: masca e binară (build_mask_for_boxes o
+        # re-binarizează după blur), deci îi dăm aici o margine moale de câțiva
+        # pixeli ca lipitura să nu se vadă ca o muchie dreaptă
+        alpha = cv2.GaussianBlur(np.asarray(roi_mask, dtype=np.float32) / 255.0, (7, 7), 0)
+        roi_data.append({'box': (rx1, ry1, rx2, ry2), 'mask': roi_mask, 'wh': (rw, rh),
+                         'alpha': alpha[:, :, None]})
         total_roi_px += rw * rh
     speedup = round((actual_w * actual_h) / max(1, total_roi_px))
     print(f"[PROC] {len(rois)} ROI(s), total {total_roi_px}px — speedup ~{speedup}x", flush=True)
@@ -340,7 +373,14 @@ def process_video(input_path, boxes, width, height, fps):
                 if result_pil.size != (roi_w, roi_h):
                     result_pil = result_pil.resize((roi_w, roi_h), Image.LANCZOS)
                 result_bgr = cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
-                bgr_in[ry1:ry2, rx1:rx2] = result_bgr
+                # Compozităm DOAR sub mască. Înainte se înlocuia tot dreptunghiul
+                # ROI cu ieșirea LaMa, deci și pixelii nemascați erau re-sintetizați
+                # (și, cu plafonul de rezoluție, ar fi ieșit înmuiați). Acum tot ce
+                # nu e text rămâne 1:1 din original, la rezoluție plină.
+                a = rd['alpha']
+                bgr_in[ry1:ry2, rx1:rx2] = (
+                    result_bgr.astype(np.float32) * a + roi_bgr.astype(np.float32) * (1.0 - a)
+                ).astype(np.uint8)
 
             if n == 0:
                 print(f"[DBG] frame={bgr_in.shape} rois={len(roi_data)}", flush=True)

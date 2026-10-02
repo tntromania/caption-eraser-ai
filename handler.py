@@ -490,6 +490,50 @@ def process_video(input_path, boxes, width, height, fps):
 # ─────────────────────────────────────────────────────────────
 # RunPod handler
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Upload rezultat
+# ─────────────────────────────────────────────────────────────
+# Proxy-ul din fața serverului (Traefik) taie orice request al cărui body
+# durează peste 100s. De pe unele hosturi RunPod uploadul merge ~0.5 MB/s, deci
+# un rezultat de 40MB+ trimis dintr-o bucată murea cu 504 / SSLEOFError. Pe
+# bucăți de 8MB fiecare request durează secunde, iar o bucată picată se
+# retrimite singură (serverul le scrie separat, deci retrimiterea e sigură).
+CHUNK_BYTES = 8 * 1024 * 1024
+CHUNK_TRIES = 4
+
+# RunPod respinge (400 la job-done) rezultatele mari returnate inline, deci
+# fallback-ul base64 are sens doar pentru fișiere mici.
+BASE64_MAX_BYTES = 7 * 1024 * 1024
+
+
+def upload_chunked(url, path, job_id):
+    size = os.path.getsize(path)
+    total = max(1, -(-size // CHUNK_BYTES))
+    t0 = time.time()
+    with open(path, 'rb') as f:
+        for i in range(total):
+            data = f.read(CHUNK_BYTES)
+            for attempt in range(1, CHUNK_TRIES + 1):
+                try:
+                    resp = requests.post(
+                        url,
+                        files={'chunk': ('part', data, 'application/octet-stream')},
+                        data={'job_id': job_id, 'index': i, 'total': total},
+                        timeout=90,
+                    )
+                    if resp.ok:
+                        break
+                    err = f"HTTP {resp.status_code}"
+                except requests.RequestException as e:
+                    err = str(e)
+                print(f"[UPLOAD] bucata {i+1}/{total}, încercarea {attempt}: {err}", flush=True)
+                if attempt == CHUNK_TRIES:
+                    raise RuntimeError(f"upload eșuat la bucata {i+1}/{total}: {err}")
+                time.sleep(2 * attempt)
+    dt = time.time() - t0
+    print(f"[UPLOAD] OK — {total} bucăți în {dt:.1f}s ({size/1024/1024/max(dt, 0.001):.2f} MB/s)", flush=True)
+
+
 def handler(job):
     inp        = job.get('input', {})
     boxes      = inp.get('boxes', [])
@@ -497,6 +541,7 @@ def handler(job):
     height     = int(inp.get('height', 0))
     fps        = float(inp.get('fps', 30.0))
     callback   = inp.get('callback_url', '')
+    chunk_url  = inp.get('callback_chunk_url', '')
     job_id     = inp.get('job_id', job.get('id', 'unknown'))
 
     tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
@@ -522,6 +567,11 @@ def handler(job):
         size_mb = os.path.getsize(out) / 1024 / 1024
         print(f"[DONE] {size_mb:.1f} MB → {out}", flush=True)
 
+        if chunk_url:
+            print(f"[UPLOAD] pe bucăți la {chunk_url}", flush=True)
+            upload_chunked(chunk_url, out, job_id)
+            return {'result_uploaded': True, 'job_id': job_id, 'size_mb': round(size_mb, 1)}
+
         if callback:
             print(f"[UPLOAD] POST la {callback}", flush=True)
             with open(out, 'rb') as f:
@@ -536,6 +586,9 @@ def handler(job):
                 return {'result_uploaded': True, 'job_id': job_id, 'size_mb': round(size_mb, 1)}
             else:
                 print(f"[UPLOAD] FAILED {resp.status_code} — fallback base64", flush=True)
+
+        if os.path.getsize(out) > BASE64_MAX_BYTES:
+            return {'error': f'Rezultatul ({size_mb:.0f} MB) nu a putut fi trimis la server'}
 
         with open(out, 'rb') as f:
             return {'video_base64': base64.b64encode(f.read()).decode()}
